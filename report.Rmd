@@ -1,0 +1,322 @@
+---
+title: "[ZED] Raport - analiza danych pochodzących z elektrowni słonecznych we Włoszech"
+author: "Piotr Bajsarowicz"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+      toc: true
+      toc_float:
+        smooth_scroll: true
+---
+
+## Podsumowanie
+Celem projektu było określenie jakie czynniki najlepiej pozwalają przewidzieć energię wytwarzaną przez panele fotowoltaiczne na podstawie danych pochodzących z trzech sąsiadujących elektrowni słonecznych we Włoszech.
+Dane pochodzą z czujników umieszczonych przy panelach fotowoltaicznych. Każdy wiersz w zbiorze danych zawiera uśrednione informacje z jednej godziny pomiarów pojedynczej jednostki fotowoltaicznej.
+
+Analiza danych wykazała korelację pomiędzy wytwarzaniem energii a poniższymi czynnikami:
+
+| Typ              | Czynniki                                              |
+| ---------------- |:------------------------------------------------------|
+| Metorologiczne   | nasłonecznienie, wilgotność, zachmurzenie, siła wiatru, ciśnienie i temperatura|
+| Geograficzne     | azymut, szerokość i wysokość geograficzna             |
+
+Najbardziej pozytywny wpływ na ilość wytwarzanie energii ma nasłonecznienie, natomiast najbardziej negatywny mają wilgotność powietrza oraz zachmurzenie.
+
+## Wykorzystane biblioteki
+```{r library, warning=FALSE, message=FALSE}
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(plotly)
+library(reshape2)
+```
+
+## Wczytywanie danych
+```{r import, cache=FALSE}
+set.seed(23)
+Sys.setenv(TZ="Europe/Warsaw")
+csv_file <- read.csv("elektrownie.csv") %>%
+  select(order(colnames(.)))
+
+```
+
+## Przygotowanie danych
+1. Zbiór nie zawiera wartości pustych (`NA`).
+```{r na}
+sum(is.na(csv_file))
+```
+2. Użyto klasy `Date` do zapisu dat (format `%m/%d/%Y %H:%M`).
+```{r convert_dates}
+csv_file <- mutate(csv_file, date = as.Date(data, format="%m/%d/%Y %H:%M"))
+```
+3. Wartości atrybutu `kwh` równe `0`, przy nasłonecznieniu (`irradiamento`, `irri`, `irri_pvgis_mod`) większym od zera zostały zinterpretowane jako błędne dane będące wynikiem awarii czujnika w chwili pomiaru. Takie dane zostały zastąpione średnimi wartościami wyprodukowanej energii w danym tygodniu i godzinie.
+```{r filtered_data_kwh}
+csv_file <- csv_file %>%
+  mutate(week = as.numeric(format(date, format="%W"))) %>%
+  group_by(idsito, anno, week, ora) %>%
+  mutate(
+    kwh = ifelse(
+      kwh == 0 & (irradiamento > 0 | irri > 0 | irri_pvgis_mod > 0),
+      mean(kwh),
+      kwh
+    )
+  )
+```
+4. Zerowe nasłonecznienie przy wartości `kwh` większej od zera zinterpretowano jako błędne dane. Każdy taki przypadek zastąpiono średnimi wartościami w danym tygodniu i godzinie.
+```{r filtered_data_insolation}
+csv_file <- csv_file %>%
+  group_by(idsito, anno, week, ora) %>%
+  mutate(
+    irradiamento = ifelse(
+      irradiamento == 0 & kwh > 0,
+      mean(irradiamento),
+      irradiamento
+    ),
+    irri = ifelse(
+      irri == 0 & kwh > 0,
+      mean(irri),
+      irri
+    ),
+    irri_pvgis_mod = ifelse(
+      irri_pvgis_mod == 0 & kwh > 0,
+      mean(irri_pvgis_mod),
+      irri_pvgis_mod
+    )
+  )
+```
+
+## Rozmiar zbioru
+``` {r rozmiar_zbioru, echo = FALSE}
+number_of_observations = nrow(csv_file)
+number_of_attributes = ncol(csv_file)
+kable(
+  data.frame(number_of_observations, number_of_attributes),
+  col.names = c("Liczba obserwacji", "Liczba atrybutów"),
+  align="l"
+)
+```
+
+## Podstawowe statystyki
+```{r podstawowe_statystyki, results='asis', echo = FALSE, warning = FALSE, error = FALSE}
+basic_statistics <- function(x){
+  c(mean=mean(x), sd=sd(x), min=min(x), max=max(x))
+}
+
+kable(
+  t(apply(csv_file, 2, basic_statistics)), 
+  escape = FALSE,
+  col.names = c("Średnia<br>arytmetyczna", "Odchylenie<br>standardowe", "Wartość<br>minimalna", "Wartość<br>maksymalna"),
+  align='lccccc'
+)
+
+```
+
+## Analiza wartości
+Atrybuty zbioru można podzielić na kilka grup przedstawionych poniżej. Każda sekcja zawiera opis każdego atrybutu oraz wykres rozkładu dla atrybutów liczbowych.
+
+### Czujnik
+Atrybuty opisowe czujników. Wartości tych atrybutów zostały znormalizowane do zakresu `<0, 1>`.
+
+| Nazwa atrybutu   | Opis                                                  |
+| ---------------- |-------------------------------------------------------|
+| `ageinmonths`    | Wiek czujnika w miesiącach                            |
+| `idbrand`        | Identyfikator marki czujnika                          |
+| `idmodel`        | Identyfikator modelu czujnika                         |
+
+```{r sensor_values, results='asis', echo = FALSE, warning = FALSE, error = FALSE, message = FALSE}
+sensor <- csv_file %>% ungroup() %>% select(ageinmonths)
+
+ggplot(data = melt(sensor), mapping = aes(x = value)) + 
+  geom_histogram(aes(y =..density..), bins = 10, col="#00293c", fill="#1e656d", alpha=.2) +
+  facet_wrap(~variable, scales = 'free_x') +
+  labs(title="Rozkład wartości danych czujnika", x="", y="Gęstość") +
+  theme_minimal()
+```
+
+### Geograficzne
+Dane o miejscu wykonania pomiaru. Wartości tych atrybutów zostały znormalizowane do zakresu `<0, 1>`.
+
+| Nazwa atrybutu   | Opis                                                  |
+| ---------------- |-------------------------------------------------------|
+| `altitude`       | Wysokość nad poziomem morza                           |
+| `azimuth`        | Azymut                                                |
+| `lat`            | Szerokość geograficzna                                |
+| `lon`            | Długość geograficzna                                  |
+
+```{r geographic_values, results='asis', echo = FALSE, warning = FALSE, error = FALSE, message = FALSE}
+geographic_values <- csv_file %>% ungroup() %>% select(altitude, azimuth, lat, lon)
+
+ggplot(data = melt(geographic_values), mapping = aes(x = value)) + 
+  geom_histogram(aes(y =..density..), bins = 10, col="#00293c", fill="#1e656d", alpha=.2) +
+  facet_wrap(~variable, scales = 'free_x') +
+  labs(title="Rozkład wartości danych geograficznych", x="", y="Gęstość") +
+  theme_minimal()
+```
+
+### Metorologiczne
+Dane meterologiczne w chwili wykonania pomiaru.
+
+| Nazwa atrybutu         | Opis                    |
+| ---------------------- |-------------------------|
+| `cloudcover`           | Zachmurzenie            |
+| `dewpoint`             | Temperatura punktu rosy |
+| `humidity`             | Wilgotność powietrza    |
+| `irradiamento`         | Nasłonecznienie         |
+| `pressure`             | Ciśnienie               |
+| `temperatura_ambiente` | Temperatura powietrza   |
+| `windbearing`          | Kierunek wiatru         |
+| `windspeed`            | Prędkość wiatru         |
+
+```{r meteorological_values, results='asis', echo = FALSE, warning = FALSE, error = FALSE, message = FALSE}
+meteorological_values <- csv_file %>% 
+  ungroup() %>%
+  select(
+   cloudcover, dewpoint, humidity, irradiamento, pressure,
+   temperatura_ambiente, windbearing, windspeed
+  )
+
+ggplot(data = melt(meteorological_values), mapping = aes(x = value)) + 
+  geom_histogram(aes(y =..density..), bins = 10, col="#00293c", fill="#1e656d", alpha=.2) +
+  facet_wrap(~variable, scales = 'free_x') +
+  labs(title="Rozkład wartości danych metorologicznych", x="", y="Gęstość") +
+  theme_minimal()
+```
+
+### Dane pomiarowe
+Dane identyfikujące pomiar, zawierające wartość wyprodukowanej energii (`kwh`).
+
+| Nazwa atrybutu         | Opis                                   |
+| ---------------------- |----------------------------------------|
+| `anno`                 | Rok pomiaru                            |
+| `data`                 | Data pomiaru                           |
+| `day`                  | Dzień pomiaru                          |
+| `id`                   | Identyfikator pomiaru                  |
+| `idsito`               | Identyfikator miejsca pomiaru          |
+| `kwh`                  | Kilowatogodziny wyprodukowanej energii |
+| `ora`                  | Godzina pomiaru                        |
+
+```{r measure_values, results='asis', echo = FALSE, warning = FALSE, error = FALSE, message = FALSE}
+measure_values <- csv_file %>% ungroup() %>% select(anno, idsito, kwh, ora)
+
+ggplot(data = melt(measure_values), mapping = aes(x = value)) + 
+  geom_histogram(aes(y =..density..), bins = 10, col="#00293c", fill="#1e656d", alpha=.2) +
+  facet_wrap(~variable, scales = 'free_x') +
+  labs(title="Rozkład wartości danych pomiarowych", x="", y="Gęstość") +
+  theme_minimal()
+```
+
+### Pozostałe
+Dane nienależące do żadnej z powyższych grup oraz trudne do interpretacji.
+
+| Nazwa atrybutu         | Opis                                   |
+| ---------------------- |----------------------------------------|
+| `dist`                 | Dzień pomiaru                          |
+| `icon`                 | Identyfikator ikony (prawdopodobnie obrazka wizualizującego aktualne warunki pogodowe)|
+| `irri`                 | Prawdopodobnie alternatywna wartość nasłonecznienia |
+| `irr_pvgis_mod`        | Prawdopodobnie wartość opisująca nasłonecznienie    |
+| `irri_pvgis_mod`       | Prawdopodobnie wartość opisująca nasłonecznienie    |
+| `pcnm1 ... pcnm15`     | _Principal Coordinates Of Neighbourhood Matrix_     |
+| `tempi`                | Wartość reprezentująca temperaturę                  |
+
+## Korelacja
+```{r correlation, echo = FALSE, error = FALSE, warning = FALSE, message = FALSE}
+get_upper_tri <- function(cormat){
+  cormat[lower.tri(cormat)]<- NA
+  return(cormat)
+}
+correlation_data <- csv_file %>% ungroup() %>% select(-c(data, date, week))
+cormat <- cor(correlation_data, use = "complete.obs")
+melted_cormat <- melt(get_upper_tri(cormat))
+
+correlation_plot <- ggplot(melted_cormat, aes(Var2, Var1, fill = value)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(
+    low = "#00293c",
+    high = "red",
+    mid = "white",
+    midpoint = 0,
+    limit = c(-1, 1),
+    name="Korelacja\nPearsona"
+  ) +
+  theme_minimal()+ 
+  theme(
+    text = element_text(size = 7),
+    axis.text.x = element_text(angle=45, hjust=1)
+  ) +
+  coord_fixed() +
+  labs(x="", y="")
+
+ggplotly(correlation_plot)
+
+```
+
+## Zmiany wytwarzania energii w czasie i przestrzeni
+```{r chart, echo = FALSE, error = FALSE, warning = FALSE, message = FALSE}
+chart <-  csv_file %>%
+  mutate(month_year = format(date, format = "%Y/%m")) %>%
+  group_by(idsito, month_year) %>%
+  summarise(sum_kwh = sum(kwh))
+
+plot <- ggplot() +
+  geom_line(
+    data=chart,
+    aes(x=month_year, y=sum_kwh, group=idsito, color=factor(x = idsito, labels=c(1:17))),
+    alpha=.6
+  ) +
+  labs(color="Czujniki") +
+  labs(title="Wytwarzanie energii w czasie przez czujniki", x = "", y = "kwh") +
+  theme(
+    axis.text.x=element_text(angle=90, vjust=0.5),
+    axis.title.x = element_text(vjust=2.5),
+    text = element_text(size = 7)
+  ) 
+
+ggplotly(plot)
+```
+
+## Regresor
+Wybrano metodę regresji liniowej.
+```{r regression}
+data_to_train <- csv_file %>%
+  ungroup() %>%
+  select(
+    altitude, azimuthi, cloudcover, dist, humidity, idsito, irradiamento, irri,
+    kwh, pressure, temperatura_ambiente, tempi, windspeed
+  )
+  
+
+inTraining <- createDataPartition(
+  y = data_to_train$idsito,
+  p = .75,
+  list = FALSE
+)
+training <- data_to_train[inTraining,]
+testing <- data_to_train[-inTraining,]
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 2,
+  repeats = 5
+)
+
+fit <- train(
+  kwh ~ .,
+  data = training,
+  method = "lm",
+  metric = "RMSE",
+  trControl = ctrl
+)
+classes <- predict(fit, newdata = testing)
+postResample(classes, testing$kwh)
+```
+
+## Analiza ważności atrybutów 
+```{r analiza}
+fit %>% summary()
+```
+Wyniki nie są zaskakujące. Atrybutami, które mają największy wpływ na ilość wytwarzanej energii przez panele fotowoltaiczne są nasłonecznienie (korelacja dodatnia) oraz wilgotność (korelacja ujemna).
+
+Prócz nasłonecznienia, na ilość wytwarzanej energii pozytywnie wpływają również wysokość nad poziomem morza oraz data wykonania pomiaru.
+Natomiast negatywny wpływ, prócz wilgotności, ma również wysoki wskaźnik atrybutów takich jak zachmurzenie, cieśnienie atmosferyczne, azymut czy prędkość wiatru.
+
+To właśnie te atrybuty pozwalają najlepiej przewidzieć energię wytwarzaną przez pojedynczy panel w danej godzinie.
